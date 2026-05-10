@@ -1,0 +1,10 @@
+vqa_1b:
+  model_args:
+    visual_proj_ckpt_dir: null
+    visual_encoder_type: llava_hr_1b
+    d_model: 2048
+  data_args:
+    data_image_size: 1024
+    pack_conversations: true
+  training_args:
+    visual_branch: true

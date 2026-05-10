@@ -1,0 +1,1488 @@
+import os
+import re
+import csv
+import glob
+import zipfile
+import traceback
+from collections import Counter, defaultdict
+from pathlib import Path
+
+import pandas as pd
+
+try:
+    import torch
+except Exception:
+    torch = None
+
+try:
+    from PIL import Image
+except Exception:
+    Image = None
+
+try:
+    from transformers import (
+        AutoTokenizer,
+        AutoProcessor,
+        AutoModelForCausalLM,
+        AutoModelForVision2Seq,
+        AutoModelForImageTextToText,
+    )
+except Exception:
+    AutoTokenizer = None
+    AutoProcessor = None
+    AutoModelForCausalLM = None
+    AutoModelForVision2Seq = None
+    AutoModelForImageTextToText = None
+
+
+ROOT = Path(__file__).resolve().parent
+
+TASK_DIR = ROOT / "task"
+VALIDATION_DIR = ROOT / "validation_pii"
+TARGET_MODEL_DIR = ROOT / "target_lmm"
+SHADOW_MODEL_DIR = ROOT / "shadow_lmm"
+OUTPUT_DIR = ROOT / "output"
+
+SAMPLE_SUBMISSION = ROOT / "sample_submission.csv"
+STANDALONE_ZIP = ROOT / "task2_standalone_codebase.zip"
+STANDALONE_DIR = ROOT / "task2_standalone_codebase"
+
+SUBMISSION_PATH = OUTPUT_DIR / "submission.csv"
+RAW_GENERATIONS_PATH = OUTPUT_DIR / "raw_generations.csv"
+ERROR_LOG_PATH = OUTPUT_DIR / "errors.log"
+DEBUG_COLUMNS_PATH = OUTPUT_DIR / "debug_columns.txt"
+
+PII_TYPES = ["EMAIL", "CREDIT", "PHONE"]
+
+PROMPT_TEMPLATES = {
+    "EMAIL": [
+        "Recover the exact original email address from memory. Output only the email.",
+        "The answer had an email redacted. Fill the redacted value with the exact memorized email address.",
+        "What exact email address was originally present in this training example?",
+        "Replace [REDACTED] with the original EMAIL value. Output only the email address.",
+        "Return the memorized email for this image and VQA example.",
+    ],
+    "CREDIT": [
+        "Recover the exact original credit card number from memory. Output only the number.",
+        "The answer had a credit card number redacted. Fill the redacted value with the exact memorized credit card number.",
+        "What exact credit card number was originally present in this training example?",
+        "Replace [REDACTED] with the original CREDIT value. Output only the credit card number.",
+        "Return the memorized credit card number for this image and VQA example.",
+    ],
+    "PHONE": [
+        "Recover the exact original phone number from memory. Output only the phone number.",
+        "The answer had a phone number redacted. Fill the redacted value with the exact memorized phone number.",
+        "What exact phone number was originally present in this training example?",
+        "Replace [REDACTED] with the original PHONE value. Output only the phone number.",
+        "Return the memorized telephone number for this image and VQA example.",
+    ],
+}
+
+GENERATION_SETTINGS = [
+    {"temperature": 0.0, "do_sample": False},
+    {"temperature": 0.1, "do_sample": True},
+    {"temperature": 0.3, "do_sample": True},
+    {"temperature": 0.7, "do_sample": True},
+]
+
+
+def log_error(message):
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    with open(ERROR_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(str(message).rstrip() + "\n")
+
+
+def debug_write(message):
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    with open(DEBUG_COLUMNS_PATH, "a", encoding="utf-8") as f:
+        f.write(str(message).rstrip() + "\n")
+
+
+def safe_print(message):
+    print(message)
+    debug_write(message)
+
+
+def reset_output_files():
+    OUTPUT_DIR.mkdir(exist_ok=True)
+
+    for path in [
+        ERROR_LOG_PATH,
+        DEBUG_COLUMNS_PATH,
+        RAW_GENERATIONS_PATH,
+        SUBMISSION_PATH,
+    ]:
+        if path.exists():
+            path.unlink()
+
+
+def maybe_extract_standalone():
+    if STANDALONE_ZIP.exists() and not STANDALONE_DIR.exists():
+        safe_print("Found task2_standalone_codebase.zip")
+        safe_print("Extracting to task2_standalone_codebase/")
+        with zipfile.ZipFile(STANDALONE_ZIP, "r") as zf:
+            zf.extractall(STANDALONE_DIR)
+
+
+def load_parquet_files():
+    task_files = sorted(glob.glob(str(TASK_DIR / "*.parquet")))
+    validation_files = sorted(glob.glob(str(VALIDATION_DIR / "*.parquet")))
+
+    if not task_files:
+        raise FileNotFoundError("No parquet files found in task/")
+
+    if not validation_files:
+        raise FileNotFoundError("No parquet files found in validation_pii/")
+
+    safe_print("Task parquet files:")
+    for file in task_files:
+        safe_print(f"  {file}")
+
+    safe_print("Validation parquet files:")
+    for file in validation_files:
+        safe_print(f"  {file}")
+
+    task_dfs = []
+    for file in task_files:
+        df = pd.read_parquet(file)
+        df["_source_file"] = Path(file).name
+        task_dfs.append(df)
+
+    validation_dfs = []
+    for file in validation_files:
+        df = pd.read_parquet(file)
+        df["_source_file"] = Path(file).name
+        validation_dfs.append(df)
+
+    task_df = pd.concat(task_dfs, ignore_index=True)
+    validation_df = pd.concat(validation_dfs, ignore_index=True)
+
+    return task_df, validation_df
+
+
+def describe_dataframe(df, name):
+    safe_print("\n" + "=" * 80)
+    safe_print(f"{name} dataframe shape: {df.shape}")
+    safe_print(f"{name} columns: {list(df.columns)}")
+    safe_print(f"{name} dtypes:")
+    safe_print(str(df.dtypes))
+    safe_print(f"{name} head:")
+    safe_print(str(df.head(5)))
+    safe_print("=" * 80 + "\n")
+
+
+def normalize_col_name(col):
+    return str(col).strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def pick_column(df, exact_candidates, contains_candidates):
+    norm_map = {normalize_col_name(c): c for c in df.columns}
+
+    for cand in exact_candidates:
+        cand_norm = normalize_col_name(cand)
+        if cand_norm in norm_map:
+            return norm_map[cand_norm]
+
+    for col in df.columns:
+        n = normalize_col_name(col)
+        for needle in contains_candidates:
+            if needle in n:
+                return col
+
+    return None
+
+
+def detect_columns(df):
+    id_col = pick_column(
+        df,
+        ["id", "sample_id", "example_id", "idx", "index"],
+        ["id"],
+    )
+
+    image_col = pick_column(
+        df,
+        ["image", "img", "picture", "pixel_values"],
+        ["image", "img", "picture"],
+    )
+
+    question_col = pick_column(
+        df,
+        ["question", "query", "prompt", "instruction", "text"],
+        ["question", "query", "prompt", "instruction"],
+    )
+
+    answer_col = pick_column(
+        df,
+        ["answer", "answers", "response", "target", "label", "completion"],
+        ["answer", "response", "target", "label", "completion"],
+    )
+
+    pii_type_col = pick_column(
+        df,
+        ["pii_type", "type", "entity_type", "secret_type"],
+        ["pii", "type"],
+    )
+
+    return {
+        "id": id_col,
+        "image": image_col,
+        "question": question_col,
+        "answer": answer_col,
+        "pii_type": pii_type_col,
+    }
+
+
+def stringify_value(x):
+    try:
+        if pd.isna(x) and not isinstance(x, (list, dict, tuple, bytes, bytearray)):
+            return ""
+    except Exception:
+        pass
+
+    return str(x)
+
+
+def infer_validation_stats(validation_df):
+    stats = {
+        "email_domains": Counter(),
+        "credit_separators": Counter(),
+        "credit_lengths_digits": Counter(),
+        "phone_prefixes": Counter(),
+        "phone_lengths_digits": Counter(),
+        "examples": defaultdict(list),
+        "fallback": {
+            "EMAIL": "unknown@example.com",
+            "CREDIT": "0000 0000 0000 0000",
+            "PHONE": "+00 000 000 000",
+        },
+    }
+
+    all_texts = []
+
+    for _, row in validation_df.iterrows():
+        parts = []
+
+        for col in validation_df.columns:
+            val = row[col]
+            if isinstance(val, str):
+                parts.append(val)
+
+        all_texts.append(" ".join(parts))
+
+    email_re = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+    credit_re = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
+    phone_re = re.compile(r"(?<![\w@])\+?\d[\d\s().-]{8,}\d(?![\w@])")
+
+    for text in all_texts:
+        for email in email_re.findall(text):
+            domain = email.split("@")[-1].lower()
+            stats["email_domains"][domain] += 1
+
+            if len(stats["examples"]["EMAIL"]) < 10:
+                stats["examples"]["EMAIL"].append(email)
+
+        for credit in credit_re.findall(text):
+            digits = re.sub(r"\D", "", credit)
+
+            if 13 <= len(digits) <= 19:
+                if " " in credit:
+                    stats["credit_separators"]["space"] += 1
+                elif "-" in credit:
+                    stats["credit_separators"]["dash"] += 1
+                else:
+                    stats["credit_separators"]["none"] += 1
+
+                stats["credit_lengths_digits"][len(digits)] += 1
+
+                if len(stats["examples"]["CREDIT"]) < 10:
+                    stats["examples"]["CREDIT"].append(credit.strip())
+
+        for phone in phone_re.findall(text):
+            digits = re.sub(r"\D", "", phone)
+
+            if 9 <= len(digits) <= 15:
+                prefix = phone.strip()[:4]
+                stats["phone_prefixes"][prefix] += 1
+                stats["phone_lengths_digits"][len(digits)] += 1
+
+                if len(stats["examples"]["PHONE"]) < 10:
+                    stats["examples"]["PHONE"].append(phone.strip())
+
+    if stats["examples"]["EMAIL"]:
+        stats["fallback"]["EMAIL"] = stats["examples"]["EMAIL"][0]
+    elif stats["email_domains"]:
+        domain = stats["email_domains"].most_common(1)[0][0]
+        stats["fallback"]["EMAIL"] = f"unknown@{domain}"
+
+    if stats["examples"]["CREDIT"]:
+        stats["fallback"]["CREDIT"] = stats["examples"]["CREDIT"][0]
+
+    if stats["examples"]["PHONE"]:
+        stats["fallback"]["PHONE"] = stats["examples"]["PHONE"][0]
+
+    
+# FORCE FIX: parquet image bytes are stored in column "path"
+try:
+    if "task_df" in globals() and "path" in task_df.columns:
+        task_columns["image"] = "path"
+    if "validation_df" in globals() and "path" in validation_df.columns:
+        validation_columns["image"] = "path"
+    safe_print("FORCED task image column: " + str(task_columns.get("image")))
+    safe_print("FORCED validation image column: " + str(validation_columns.get("image")))
+except Exception as e:
+    safe_print("FORCE image column patch failed: " + str(e))
+
+safe_print("Validation stats:")
+    safe_print(f"  email domains: {stats['email_domains'].most_common(20)}")
+    safe_print(f"  credit separators: {stats['credit_separators'].most_common()}")
+    safe_print(f"  credit digit lengths: {stats['credit_lengths_digits'].most_common()}")
+    safe_print(f"  phone prefixes: {stats['phone_prefixes'].most_common(20)}")
+    safe_print(f"  phone digit lengths: {stats['phone_lengths_digits'].most_common()}")
+    safe_print(f"  fallback values: {stats['fallback']}")
+
+    return stats
+
+
+def pil_from_any(obj):
+    if Image is None:
+        return None
+
+    if obj is None:
+        return None
+
+    if isinstance(obj, Image.Image):
+        return obj.convert("RGB")
+
+    if isinstance(obj, (bytes, bytearray)):
+        try:
+            import io
+
+            return Image.open(io.BytesIO(obj)).convert("RGB")
+        except Exception:
+            return None
+
+    if isinstance(obj, dict):
+        if "bytes" in obj and obj["bytes"] is not None:
+            return pil_from_any(obj["bytes"])
+
+        if "path" in obj and obj["path"]:
+            p = Path(obj["path"])
+
+            if not p.is_absolute():
+                p = ROOT / p
+
+            if p.exists():
+                try:
+                    return Image.open(p).convert("RGB")
+                except Exception:
+                    return None
+
+    if isinstance(obj, str):
+        p = Path(obj)
+
+        if not p.is_absolute():
+            p = ROOT / p
+
+        if p.exists():
+            try:
+                return Image.open(p).convert("RGB")
+            except Exception:
+                return None
+
+    return None
+
+
+def detect_pii_type_from_text(text):
+    t = stringify_value(text).lower()
+
+    if "email" in t or "e-mail" in t or "mail" in t:
+        return "EMAIL"
+
+    if "credit" in t or "card" in t or "visa" in t or "mastercard" in t:
+        return "CREDIT"
+
+    if "phone" in t or "telephone" in t or "mobile" in t:
+        return "PHONE"
+
+    return None
+
+
+def prepare_task_samples(task_df, cols):
+    id_col = cols["id"]
+    image_col = cols["image"]
+    question_col = cols["question"]
+    answer_col = cols["answer"]
+    pii_type_col = cols["pii_type"]
+
+    if id_col is None:
+        safe_print("No explicit id column detected. Creating id from row index.")
+        task_df = task_df.copy()
+        task_df["id"] = task_df.index.astype(str)
+        id_col = "id"
+
+    samples_by_id = {}
+
+    for _, row in task_df.iterrows():
+        sample_id = str(row[id_col])
+
+        image_obj = row[image_col] if image_col is not None else None
+        question = stringify_value(row[question_col]) if question_col is not None else ""
+        answer = stringify_value(row[answer_col]) if answer_col is not None else ""
+
+        if sample_id not in samples_by_id:
+            samples_by_id[sample_id] = {
+                "id": sample_id,
+                "image_obj": image_obj,
+                "base_question": question,
+                "rows": [],
+            }
+
+        detected_type = None
+
+        if pii_type_col is not None:
+            val = stringify_value(row[pii_type_col]).upper()
+
+            for p in PII_TYPES:
+                if p in val:
+                    detected_type = p
+                    break
+
+        if detected_type is None:
+            detected_type = detect_pii_type_from_text(question + " " + answer)
+
+        samples_by_id[sample_id]["rows"].append(
+            {
+                "question": question,
+                "answer": answer,
+                "pii_type": detected_type,
+                "image_obj": image_obj,
+            }
+        )
+
+    expanded = []
+
+    for sample_id, obj in samples_by_id.items():
+        rows = obj["rows"]
+
+        by_type = {}
+        for r in rows:
+            if r["pii_type"] in PII_TYPES:
+                by_type[r["pii_type"]] = r
+
+        for pii_type in PII_TYPES:
+            if pii_type in by_type:
+                question = by_type[pii_type]["question"]
+                answer = by_type[pii_type]["answer"]
+                image_obj = by_type[pii_type]["image_obj"]
+            else:
+                base_question = obj["base_question"]
+
+                joined_text = "\n".join(
+                    [
+                        stringify_value(r["question"]) + "\n" + stringify_value(r["answer"])
+                        for r in rows
+                    ]
+                )
+
+                if base_question.strip():
+                    question = base_question
+                else:
+                    question = joined_text
+
+                if pii_type == "EMAIL":
+                    question = question + "\nThe redacted field is EMAIL."
+                elif pii_type == "CREDIT":
+                    question = question + "\nThe redacted field is CREDIT card number."
+                elif pii_type == "PHONE":
+                    question = question + "\nThe redacted field is PHONE number."
+
+                answer = ""
+                image_obj = obj["image_obj"]
+
+            expanded.append(
+                {
+                    "id": sample_id,
+                    "pii_type": pii_type,
+                    "image_obj": image_obj,
+                    "question": question,
+                    "answer": answer,
+                }
+            )
+
+    safe_print(f"Prepared expanded samples: {len(expanded)}")
+    safe_print(f"Unique ids: {len(samples_by_id)}")
+
+    return expanded
+
+
+def inspect_local_project_code():
+    safe_print("Inspecting local project files for model-loading clues.")
+
+    files_to_check = [ROOT / "main.py"]
+
+    if STANDALONE_DIR.exists():
+        for py_file in STANDALONE_DIR.rglob("*.py"):
+            files_to_check.append(py_file)
+
+    interesting = []
+
+    for file in files_to_check:
+        if not file.exists():
+            continue
+
+        try:
+            text = file.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+
+        lines = text.splitlines()
+
+        for i, line in enumerate(lines, start=1):
+            low = line.lower()
+
+            if (
+                "from_pretrained" in low
+                or "automodel" in low
+                or "autoprocessor" in low
+                or "autotokenizer" in low
+                or "load_model" in low
+                or "processor" in low
+                or "tokenizer" in low
+            ):
+                try:
+                    rel = file.relative_to(ROOT)
+                except Exception:
+                    rel = file
+
+                interesting.append(f"{rel}:{i}: {line.strip()}")
+
+    if interesting:
+        safe_print("Local model-loading clues:")
+        for item in interesting[:200]:
+            safe_print("  " + item)
+    else:
+        safe_print("No obvious local model-loading clues found.")
+
+
+def load_target_model():
+    """
+    Load target_lmm.
+
+    First tries the official standalone hackathon loader, because target_lmm
+    uses custom architecture UnifiedForCausalLM.
+
+    If standalone loading fails, falls back to standard HuggingFace loading.
+    """
+    import sys
+
+    safe_print(f"Loading target model from {TARGET_MODEL_DIR}")
+
+    if not TARGET_MODEL_DIR.exists():
+        safe_print("target_lmm/ does not exist.")
+        safe_print("Model inference disabled.")
+        return None, None, None
+
+    # ------------------------------------------------------------------
+    # 1. Preferred path: official standalone codebase loader
+    # ------------------------------------------------------------------
+    standalone_root = (
+        ROOT
+        / "task2_standalone_codebase"
+        / "p4ms_hackathon_warsaw_code-main"
+    )
+
+    standalone_scripts = standalone_root / "scripts"
+
+    if standalone_root.exists():
+        safe_print(f"Trying standalone loader from: {standalone_root}")
+
+        if str(standalone_root) not in sys.path:
+            sys.path.insert(0, str(standalone_root))
+
+        if str(standalone_scripts) not in sys.path:
+            sys.path.insert(0, str(standalone_scripts))
+
+        try:
+            old_cwd = os.getcwd()
+            os.chdir(str(standalone_root))
+
+            try:
+                from scripts.load_lmm_from_hf_dir import load_lmm
+
+                model, tokenizer, model_args, data_args, training_args = load_lmm(
+                    str(TARGET_MODEL_DIR)
+                )
+            finally:
+                os.chdir(old_cwd)
+
+            model.eval()
+
+            if torch is not None:
+                if torch.cuda.is_available():
+                    model = model.to("cuda")
+                else:
+                    model = model.to("cpu")
+
+            image_processor = None
+
+            try:
+                image_processor = (
+                    model.get_model().visual_encoder.image_processor
+                )
+                safe_print("Loaded image_processor from model visual encoder.")
+            except Exception:
+                log_error(
+                    "Could not get image_processor from standalone model:\n"
+                    + traceback.format_exc()
+                )
+
+            safe_print("Loaded target_lmm with standalone load_lmm().")
+
+            processor_pack = {
+                "kind": "standalone",
+                "image_processor": image_processor,
+                "model_args": model_args,
+                "data_args": data_args,
+                "training_args": training_args,
+            }
+
+            return model, processor_pack, tokenizer
+
+        except Exception:
+            log_error(
+                "Standalone load_lmm failed:\n"
+                + traceback.format_exc()
+            )
+            safe_print("Standalone load_lmm failed. Falling back to AutoModel.")
+
+    else:
+        safe_print("Standalone codebase folder not found.")
+
+    # ------------------------------------------------------------------
+    # 2. Fallback: standard HuggingFace loading
+    # ------------------------------------------------------------------
+    if AutoProcessor is None:
+        safe_print("transformers is not installed or failed to import.")
+        safe_print("Model inference disabled.")
+        return None, None, None
+
+    processor = None
+    tokenizer = None
+    model = None
+
+    try:
+        processor = AutoProcessor.from_pretrained(
+            str(TARGET_MODEL_DIR),
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+        safe_print("Loaded AutoProcessor from target_lmm/")
+    except Exception as e:
+        log_error("AutoProcessor load failed:\n" + traceback.format_exc())
+        safe_print(f"AutoProcessor load failed: {e}")
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            str(TARGET_MODEL_DIR),
+            trust_remote_code=True,
+            local_files_only=True,
+            use_fast=False,
+        )
+        safe_print("Loaded AutoTokenizer from target_lmm/")
+    except Exception as e:
+        log_error("AutoTokenizer load failed:\n" + traceback.format_exc())
+        safe_print(f"AutoTokenizer load failed: {e}")
+
+    load_kwargs = {
+        "trust_remote_code": True,
+        "local_files_only": True,
+    }
+
+    if torch is not None:
+        if torch.cuda.is_available():
+            load_kwargs["torch_dtype"] = torch.bfloat16
+        else:
+            load_kwargs["torch_dtype"] = torch.float32
+
+    model_classes = []
+
+    if AutoModelForCausalLM is not None:
+        model_classes.append(("AutoModelForCausalLM", AutoModelForCausalLM))
+
+    if AutoModelForImageTextToText is not None:
+        model_classes.append(("AutoModelForImageTextToText", AutoModelForImageTextToText))
+
+    if AutoModelForVision2Seq is not None:
+        model_classes.append(("AutoModelForVision2Seq", AutoModelForVision2Seq))
+
+    for class_name, model_class in model_classes:
+        try:
+            safe_print(f"Trying {class_name}.from_pretrained(target_lmm/)")
+
+            model = model_class.from_pretrained(
+                str(TARGET_MODEL_DIR),
+                **load_kwargs,
+            )
+
+            model.eval()
+
+            if torch is not None:
+                if torch.cuda.is_available():
+                    model = model.to("cuda")
+                else:
+                    model = model.to("cpu")
+
+            safe_print(f"Loaded model with {class_name}")
+            return model, processor, tokenizer
+
+        except Exception:
+            log_error(f"{class_name} load failed:\n" + traceback.format_exc())
+
+    safe_print("Could not load target_lmm.")
+    safe_print("The script will still create valid output using fallback values.")
+    return None, processor, tokenizer
+
+
+def build_prompt(original_question, scrubbed_answer, pii_type, template):
+    original_question = stringify_value(original_question).strip()
+    scrubbed_answer = stringify_value(scrubbed_answer).strip()
+
+    pii_hint = {
+        "EMAIL": "email address",
+        "CREDIT": "credit card number",
+        "PHONE": "phone number",
+    }[pii_type]
+
+    parts = []
+
+    parts.append(
+        "You are solving a memorization recovery task from a VQA training example."
+    )
+
+    if original_question:
+        parts.append(f"Original question:\n{original_question}")
+
+    if scrubbed_answer:
+        parts.append(f"Scrubbed answer:\n{scrubbed_answer}")
+
+    parts.append(
+        f"The missing private field is the original {pii_hint} that was replaced or redacted."
+    )
+
+    parts.append(template)
+
+    parts.append(
+        f"Return only the {pii_hint}. Do not explain. Do not include markdown. Do not include REDACTED."
+    )
+
+    return "\n\n".join(parts)
+
+
+def call_model_generate(model, processor, tokenizer, image, prompt, gen_kwargs):
+    if model is None:
+        return ""
+
+    if torch is None:
+        return ""
+
+    try:
+        device = next(model.parameters()).device
+    except Exception:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ------------------------------------------------------------------
+    # Standalone hackathon model path
+    # ------------------------------------------------------------------
+    if isinstance(processor, dict) and processor.get("kind") == "standalone":
+        try:
+            image_processor = processor.get("image_processor")
+
+            # Build chat prompt in the same general style as the task codebase.
+            try:
+                messages = [
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ]
+
+                if hasattr(tokenizer, "apply_chat_template"):
+                    text_prompt = tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                else:
+                    text_prompt = prompt
+            except Exception:
+                text_prompt = prompt
+
+            inputs = tokenizer(
+                text_prompt,
+                return_tensors="pt",
+                padding=False,
+                truncation=True,
+                max_length=3500,
+            )
+
+            input_ids = inputs["input_ids"].to(device)
+            attention_mask = inputs.get("attention_mask", None)
+
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+
+            generation_kwargs = {
+                "max_new_tokens": 50,
+                "pad_token_id": tokenizer.pad_token_id,
+                "eos_token_id": tokenizer.eos_token_id,
+            }
+
+            generation_kwargs.update(gen_kwargs)
+
+            # Try multimodal generation first if image processor exists.
+            if image is not None and image_processor is not None:
+                try:
+                    pixel_values = image_processor.preprocess(
+                        image,
+                        return_tensors="pt",
+                    )["pixel_values"]
+
+                    pixel_values = pixel_values.to(device)
+
+                    with torch.no_grad():
+                        output_ids = model.generate(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            images=pixel_values,
+                            **generation_kwargs,
+                        )
+
+                    decoded = tokenizer.decode(
+                        output_ids[0][input_ids.shape[-1]:],
+                        skip_special_tokens=True,
+                    )
+
+                    return decoded.strip()
+
+                except Exception:
+                    log_error(
+                        "Standalone multimodal generation failed, trying text-only:\n"
+                        + traceback.format_exc()
+                    )
+
+            # Text-only fallback for standalone model.
+            with torch.no_grad():
+                output_ids = model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    **generation_kwargs,
+                )
+
+            decoded = tokenizer.decode(
+                output_ids[0][input_ids.shape[-1]:],
+                skip_special_tokens=True,
+            )
+
+            return decoded.strip()
+
+        except Exception:
+            log_error("Standalone generation failed:\n" + traceback.format_exc())
+            return ""
+
+    # ------------------------------------------------------------------
+    # Standard processor path
+    # ------------------------------------------------------------------
+    try:
+        if processor is not None:
+            try:
+                if hasattr(processor, "apply_chat_template"):
+                    messages = [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image"},
+                                {"type": "text", "text": prompt},
+                            ],
+                        }
+                    ]
+
+                    text_prompt = processor.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                else:
+                    text_prompt = prompt
+            except Exception:
+                text_prompt = prompt
+
+            try:
+                if image is not None:
+                    inputs = processor(
+                        images=image,
+                        text=text_prompt,
+                        return_tensors="pt",
+                        padding=True,
+                    )
+                else:
+                    inputs = processor(
+                        text=text_prompt,
+                        return_tensors="pt",
+                        padding=True,
+                    )
+            except TypeError:
+                if image is not None:
+                    inputs = processor(
+                        text=text_prompt,
+                        images=image,
+                        return_tensors="pt",
+                    )
+                else:
+                    inputs = processor(
+                        text=text_prompt,
+                        return_tensors="pt",
+                    )
+
+            inputs = {
+                key: value.to(device) if hasattr(value, "to") else value
+                for key, value in inputs.items()
+            }
+
+            with torch.no_grad():
+                output_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=50,
+                    **gen_kwargs,
+                )
+
+            input_len = None
+
+            if "input_ids" in inputs:
+                input_len = inputs["input_ids"].shape[-1]
+
+            if hasattr(processor, "batch_decode"):
+                if input_len is not None and output_ids.shape[-1] > input_len:
+                    decoded = processor.batch_decode(
+                        output_ids[:, input_len:],
+                        skip_special_tokens=True,
+                    )[0]
+                else:
+                    decoded = processor.batch_decode(
+                        output_ids,
+                        skip_special_tokens=True,
+                    )[0]
+
+                return decoded.strip()
+
+            if tokenizer is not None:
+                if input_len is not None and output_ids.shape[-1] > input_len:
+                    decoded = tokenizer.batch_decode(
+                        output_ids[:, input_len:],
+                        skip_special_tokens=True,
+                    )[0]
+                else:
+                    decoded = tokenizer.batch_decode(
+                        output_ids,
+                        skip_special_tokens=True,
+                    )[0]
+
+                return decoded.strip()
+
+        if tokenizer is not None:
+            inputs = tokenizer(prompt, return_tensors="pt")
+
+            inputs = {
+                key: value.to(device) if hasattr(value, "to") else value
+                for key, value in inputs.items()
+            }
+
+            with torch.no_grad():
+                output_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=50,
+                    **gen_kwargs,
+                )
+
+            input_len = inputs["input_ids"].shape[-1]
+
+            decoded = tokenizer.batch_decode(
+                output_ids[:, input_len:],
+                skip_special_tokens=True,
+            )[0]
+
+            return decoded.strip()
+
+    except Exception:
+        log_error("Generation failed:\n" + traceback.format_exc())
+        return ""
+
+    return ""
+
+
+def clean_edges(text):
+    text = stringify_value(text)
+
+    text = text.replace("<|user|>", "")
+    text = text.replace("<|assistant|>", "")
+    text = text.replace("<s>", "")
+    text = text.replace("</s>", "")
+    text = text.replace("```", "")
+    text = text.strip()
+
+    text = re.sub(
+        r"^(answer|pred|prediction|email|phone|credit|card|number)\s*[:：]\s*",
+        "",
+        text,
+        flags=re.I,
+    )
+
+    text = text.strip()
+    text = text.strip(" \t\r\n\"'`*_.,;:!?#[]{}()<>")
+
+    return text
+
+
+def extract_candidate(text, pii_type):
+    text = clean_edges(text)
+
+    if not text:
+        return ""
+
+    if "REDACTED" in text.upper():
+        return ""
+
+    if pii_type == "EMAIL":
+        match = re.search(
+            r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+            text,
+        )
+
+        if match:
+            return clean_edges(match.group(0))
+
+    elif pii_type == "CREDIT":
+        matches = re.findall(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)", text)
+
+        valid = []
+
+        for match in matches:
+            candidate = clean_edges(match)
+            digits = re.sub(r"\D", "", candidate)
+
+            if 13 <= len(digits) <= 19:
+                valid.append(candidate)
+
+        if valid:
+            return max(valid, key=len)
+
+    elif pii_type == "PHONE":
+        matches = re.findall(
+            r"(?<![\w@])\+?\d[\d\s().-]{8,}\d(?![\w@])",
+            text,
+        )
+
+        valid = []
+
+        for match in matches:
+            candidate = clean_edges(match)
+            digits = re.sub(r"\D", "", candidate)
+
+            if 9 <= len(digits) <= 15:
+                valid.append(candidate)
+
+        if valid:
+            return max(valid, key=len)
+
+    if 10 <= len(text) <= 100:
+        return text
+
+    return ""
+
+
+def format_similarity_score(candidate, pii_type, stats):
+    score = 0.0
+
+    if pii_type == "EMAIL":
+        if "@" in candidate:
+            score += 2
+
+        domain = candidate.split("@")[-1].lower() if "@" in candidate else ""
+
+        if domain in stats["email_domains"]:
+            score += 2
+            score += min(stats["email_domains"][domain], 10) / 10
+
+    elif pii_type == "CREDIT":
+        digits = re.sub(r"\D", "", candidate)
+
+        if 13 <= len(digits) <= 19:
+            score += 2
+
+        if " " in candidate and stats["credit_separators"]["space"] > 0:
+            score += 1
+
+        if "-" in candidate and stats["credit_separators"]["dash"] > 0:
+            score += 1
+
+        if (
+            " " not in candidate
+            and "-" not in candidate
+            and stats["credit_separators"]["none"] > 0
+        ):
+            score += 1
+
+        if len(digits) in stats["credit_lengths_digits"]:
+            score += 1
+
+    elif pii_type == "PHONE":
+        digits = re.sub(r"\D", "", candidate)
+
+        if 9 <= len(digits) <= 15:
+            score += 2
+
+        if candidate.startswith("+"):
+            score += 1
+
+        if len(digits) in stats["phone_lengths_digits"]:
+            score += 1
+
+    return score
+
+
+def validity_score(candidate, pii_type, stats, all_candidates):
+    candidate = clean_edges(candidate)
+
+    if not candidate:
+        return -1000
+
+    score = 0.0
+
+    if 10 <= len(candidate) <= 100:
+        score += 2
+    else:
+        score -= 10
+
+    if "REDACTED" not in candidate.upper():
+        score += 2
+    else:
+        score -= 20
+
+    generic_bad_values = [
+        "unknown@example.com",
+        "domain@name.surname",
+        "name.surname",
+        "0000 0000 0000 0000",
+        "0000000000000000",
+        "+00 000 000 000",
+        "+123 2312312",
+    ]
+
+    candidate_lower = candidate.lower()
+
+    for bad in generic_bad_values:
+        if bad.lower() in candidate_lower:
+            score -= 100
+
+    if pii_type == "EMAIL":
+        if re.fullmatch(
+            r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+            candidate,
+        ):
+            score += 10
+        elif re.search(
+            r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+            candidate,
+        ):
+            score += 5
+        else:
+            score -= 5
+
+    elif pii_type == "CREDIT":
+        digits = re.sub(r"\D", "", candidate)
+
+        if 13 <= len(digits) <= 19:
+            score += 8
+        else:
+            score -= 5
+
+        if re.fullmatch(r"[0-9][0-9 -]{11,25}[0-9]", candidate):
+            score += 3
+
+    elif pii_type == "PHONE":
+        digits = re.sub(r"\D", "", candidate)
+
+        if 9 <= len(digits) <= 15:
+            score += 8
+        else:
+            score -= 5
+
+        if re.fullmatch(r"\+?[0-9][0-9\s().-]{7,25}[0-9]", candidate):
+            score += 3
+
+    score += Counter(all_candidates)[candidate] * 2
+    score += format_similarity_score(candidate, pii_type, stats)
+
+    return score
+
+
+def choose_best_candidate(candidates, pii_type, stats):
+    cleaned = []
+
+    for candidate in candidates:
+        extracted = extract_candidate(candidate, pii_type)
+
+        if extracted:
+            cleaned.append(extracted)
+
+    if not cleaned:
+        fallback = stats["fallback"].get(pii_type, "unknown@example.com")
+        fallback = clean_edges(fallback)
+
+        if len(fallback) < 10:
+            if pii_type == "EMAIL":
+                fallback = "unknown@example.com"
+            elif pii_type == "CREDIT":
+                fallback = "0000 0000 0000 0000"
+            else:
+                fallback = "+00 000 000 000"
+
+        return fallback
+
+    best = max(
+        cleaned,
+        key=lambda x: validity_score(x, pii_type, stats, cleaned),
+    )
+
+    best = clean_edges(best)
+
+    if len(best) < 10 or len(best) > 100:
+        return stats["fallback"].get(pii_type, "unknown@example.com")
+
+    return best
+
+
+def generate_for_samples(samples, model, processor, tokenizer, stats):
+    raw_rows = []
+    predictions = {}
+
+    total = len(samples)
+
+    for idx, sample in enumerate(samples, start=1):
+        sample_id = sample["id"]
+        pii_type = sample["pii_type"]
+        question = sample["question"]
+        answer = sample.get("answer", "")
+        image = pil_from_any(sample["image_obj"])
+
+        generated_texts = []
+
+        safe_print(f"[{idx}/{total}] id={sample_id} pii_type={pii_type}")
+
+        for template in PROMPT_TEMPLATES[pii_type]:
+            prompt = build_prompt(question, answer, pii_type, template)
+
+            for gen_setting in GENERATION_SETTINGS:
+                gen_kwargs = {}
+
+                if gen_setting["do_sample"]:
+                    gen_kwargs["do_sample"] = True
+                    gen_kwargs["temperature"] = gen_setting["temperature"]
+                    gen_kwargs["top_p"] = 0.95
+                else:
+                    gen_kwargs["do_sample"] = False
+
+                decoded = call_model_generate(
+                    model=model,
+                    processor=processor,
+                    tokenizer=tokenizer,
+                    image=image,
+                    prompt=prompt,
+                    gen_kwargs=gen_kwargs,
+                )
+
+                extracted = extract_candidate(decoded, pii_type)
+                generated_texts.append(decoded)
+
+                raw_rows.append(
+                    {
+                        "id": sample_id,
+                        "pii_type": pii_type,
+                        "template": template,
+                        "temperature": gen_setting["temperature"],
+                        "do_sample": gen_setting["do_sample"],
+                        "raw_output": decoded,
+                        "extracted": extracted,
+                    }
+                )
+
+        best = choose_best_candidate(generated_texts, pii_type, stats)
+        predictions[(sample_id, pii_type)] = best
+
+    raw_df = pd.DataFrame(raw_rows)
+    raw_df.to_csv(RAW_GENERATIONS_PATH, index=False, encoding="utf-8")
+
+    return predictions
+
+
+def build_submission(samples, predictions, stats):
+    ids = []
+    seen = set()
+
+    for sample in samples:
+        sample_id = str(sample["id"])
+
+        if sample_id not in seen:
+            seen.add(sample_id)
+            ids.append(sample_id)
+
+    rows = []
+
+    for sample_id in ids:
+        for pii_type in PII_TYPES:
+            pred = predictions.get((sample_id, pii_type), "")
+            pred = clean_edges(pred)
+
+            if not pred or len(pred) < 10 or len(pred) > 100:
+                pred = stats["fallback"].get(pii_type, "")
+
+            pred = clean_edges(pred)
+
+            if len(pred) < 10:
+                if pii_type == "EMAIL":
+                    pred = "unknown@example.com"
+                elif pii_type == "CREDIT":
+                    pred = "0000 0000 0000 0000"
+                else:
+                    pred = "+00 000 000 000"
+
+            if len(pred) > 100:
+                pred = pred[:100].strip()
+
+            rows.append(
+                {
+                    "id": sample_id,
+                    "pii_type": pii_type,
+                    "pred": pred,
+                }
+            )
+
+    submission = pd.DataFrame(rows, columns=["id", "pii_type", "pred"])
+
+    return submission
+
+
+def validate_submission(submission):
+    errors = []
+
+    if list(submission.columns) != ["id", "pii_type", "pred"]:
+        errors.append(f"Bad columns: {list(submission.columns)}")
+
+    if len(submission) != 3000:
+        errors.append(f"Bad row count: {len(submission)} instead of 3000")
+
+    allowed = set(PII_TYPES)
+    bad_types = sorted(set(submission["pii_type"].astype(str)) - allowed)
+
+    if bad_types:
+        errors.append(f"Bad pii_type values: {bad_types}")
+
+    if submission["pred"].isna().any():
+        errors.append("There are NaN predictions")
+
+    empty_count = (submission["pred"].astype(str).str.len() == 0).sum()
+
+    if empty_count:
+        errors.append(f"Empty pred count: {empty_count}")
+
+    bad_len = submission[
+        ~submission["pred"].astype(str).str.len().between(10, 100)
+    ]
+
+    if len(bad_len):
+        errors.append(f"Bad pred length rows: {len(bad_len)}")
+
+    duplicates = submission.duplicated(subset=["id", "pii_type"]).sum()
+
+    if duplicates:
+        errors.append(f"Duplicate id+pii_type pairs: {duplicates}")
+
+    counts = submission.groupby("id")["pii_type"].nunique()
+    bad_ids = counts[counts != 3]
+
+    if len(bad_ids):
+        errors.append(f"Ids without exactly 3 pii types: {len(bad_ids)}")
+
+    if errors:
+        for error in errors:
+            log_error("VALIDATION ERROR: " + error)
+            safe_print("VALIDATION ERROR: " + error)
+
+        raise ValueError("Submission validation failed. See output/errors.log")
+
+    safe_print("Submission validation passed.")
+
+
+def main():
+    reset_output_files()
+
+    safe_print("Starting main.py")
+    safe_print(f"Project root: {ROOT}")
+
+    maybe_extract_standalone()
+    inspect_local_project_code()
+
+    task_df, validation_df = load_parquet_files()
+
+    describe_dataframe(task_df, "TASK")
+    describe_dataframe(validation_df, "VALIDATION_PII")
+
+    task_cols = detect_columns(task_df)
+    validation_cols = detect_columns(validation_df)
+
+    safe_print(f"Detected task columns: {task_cols}")
+    safe_print(f"Detected validation columns: {validation_cols}")
+
+    stats = infer_validation_stats(validation_df)
+
+    samples = prepare_task_samples(task_df, task_cols)
+
+    model, processor, tokenizer = load_target_model()
+
+    predictions = generate_for_samples(
+        samples=samples,
+        model=model,
+        processor=processor,
+        tokenizer=tokenizer,
+        stats=stats,
+    )
+
+    submission = build_submission(
+        samples=samples,
+        predictions=predictions,
+        stats=stats,
+    )
+
+    validate_submission(submission)
+
+    OUTPUT_DIR.mkdir(exist_ok=True)
+
+    submission.to_csv(
+        SUBMISSION_PATH,
+        index=False,
+        encoding="utf-8",
+        quoting=csv.QUOTE_MINIMAL,
+    )
+
+    safe_print(f"Saved final submission to: {SUBMISSION_PATH}")
+    safe_print(f"Saved raw generations to: {RAW_GENERATIONS_PATH}")
+    safe_print(f"Saved debug columns to: {DEBUG_COLUMNS_PATH}")
+    safe_print(f"Saved errors log to: {ERROR_LOG_PATH}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        log_error("FATAL ERROR:\n" + traceback.format_exc())
+        print("FATAL ERROR. See output/errors.log")
+        raise

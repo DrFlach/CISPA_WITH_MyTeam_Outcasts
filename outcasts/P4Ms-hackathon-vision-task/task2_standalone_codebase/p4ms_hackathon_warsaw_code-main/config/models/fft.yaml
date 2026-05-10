@@ -1,0 +1,17 @@
+defaults:
+  olmo2_vqa_1b_base:
+    blueprint: vqa_1b
+    model_args:
+      llm_name: default_olmo2
+      model_name_or_path: allenai/OLMo-2-0425-1B-Instruct
+    training_args:
+      save_modules: model
+
+olmo2_vqa_1b:
+  default: olmo2_vqa_1b_base
+  model_args:
+    pretrained_ckpt_path: models/hackathon_models/olmo2_vqa_1b/non_lora_trainables.bin
+olmo2_vqa_1b_shadow:
+  default: olmo2_vqa_1b_base
+  model_args:
+    pretrained_ckpt_path: models/hackathon_models/olmo2_vqa_1b_shadow/non_lora_trainables.bin

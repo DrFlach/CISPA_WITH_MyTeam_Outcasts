@@ -1,0 +1,22 @@
+[project]
+name = "llm-watermark-detection"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.13.0",
+    "lightgbm>=4.3",
+    "numpy>=2.4.4",
+    "pandas>=3.0.2",
+    "protobuf",
+    "pyarrow>=15.0",
+    "requests>=2.33.1",
+    "scikit-learn>=1.4",
+    "scipy>=1.17.1",
+    "sentence-transformers>=5.4.1",
+    "sentencepiece",
+    "torch>=2.11.0",
+    "tqdm>=4.66",
+    "transformers>=5.8.0",
+]

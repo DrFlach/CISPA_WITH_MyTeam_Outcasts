@@ -1,0 +1,114 @@
+llava_hr_1b:
+  encoder:
+    _target_: src.lmms.models.llava_hr_vision.multipath_encoder_wrapper.MultiPathCLIPVisionTower
+    vision_tower: openai/clip-vit-large-patch14-336
+    args:
+      vision_tower_slow: convnext_large_mlp.clip_laion2b_ft_320
+      input_image_size: 1024
+      mm_vision_select_layer: -2
+      mm_vision_select_feature: patch
+      freeze_vision: False
+  projector:
+    _target_: src.lmms.models.llava_hr_vision.projector.build_vision_projector
+    config:
+      mm_projector_type: mlp2x_gelu
+      mm_hidden_size: 1024
+      hidden_size: 2048 # aka d_model
+llava_hr_1b_gemma:
+  encoder:
+    _target_: src.lmms.models.llava_hr_vision.multipath_encoder_wrapper.MultiPathCLIPVisionTower
+    vision_tower: openai/clip-vit-large-patch14-336
+    args:
+      vision_tower_slow: convnext_large_mlp.clip_laion2b_ft_320
+      input_image_size: 1024
+      mm_vision_select_layer: -2
+      mm_vision_select_feature: patch
+      freeze_vision: False
+  projector:
+    _target_: src.lmms.models.llava_hr_vision.projector.build_vision_projector
+    config:
+      mm_projector_type: mlp2x_gelu
+      mm_hidden_size: 1024
+      hidden_size: 1152 # aka d_model
+llava_hr_1b_align:
+  encoder:
+    _target_: src.lmms.models.llava_hr_vision.multipath_encoder_wrapper.MultiPathCLIPVisionTower
+    vision_tower: openai/clip-vit-large-patch14-336
+    args:
+      vision_tower_slow: convnext_large_mlp.clip_laion2b_ft_320
+      input_image_size: 384
+      mm_vision_select_layer: -2
+      mm_vision_select_feature: patch
+      freeze_vision: True
+  projector:
+    _target_: src.lmms.models.llava_hr_vision.projector.build_vision_projector
+    config:
+      mm_projector_type: mlp2x_gelu
+      mm_hidden_size: 1024
+      hidden_size: 2048 # aka d_model
+
+llava_hr_7b:
+  encoder:
+    _target_: src.lmms.models.llava_hr_vision.multipath_encoder_wrapper.MultiPathCLIPVisionTower
+    vision_tower: openai/clip-vit-large-patch14-336
+    args:
+      vision_tower_slow: convnext_large_mlp.clip_laion2b_ft_320
+      input_image_size: 1024
+      mm_vision_select_layer: -2
+      mm_vision_select_feature: patch
+      freeze_vision: False
+  projector:
+    _target_: src.lmms.models.llava_hr_vision.projector.build_vision_projector
+    config:
+      mm_projector_type: mlp2x_gelu
+      mm_hidden_size: 1024
+      hidden_size: 4096 # aka d_model
+llava_hr_7b_align:
+  encoder:
+    _target_: src.lmms.models.llava_hr_vision.multipath_encoder_wrapper.MultiPathCLIPVisionTower
+    vision_tower: openai/clip-vit-large-patch14-336
+    args:
+      vision_tower_slow: convnext_large_mlp.clip_laion2b_ft_320
+      input_image_size: 384
+      mm_vision_select_layer: -2
+      mm_vision_select_feature: patch
+      freeze_vision: True
+  projector:
+    _target_: src.lmms.models.llava_hr_vision.projector.build_vision_projector
+    config:
+      mm_projector_type: mlp2x_gelu
+      mm_hidden_size: 1024
+      hidden_size: 4096 # aka d_model
+
+llava_hr_3b:
+  encoder:
+    _target_: src.lmms.models.llava_hr_vision.multipath_encoder_wrapper.MultiPathCLIPVisionTower
+    vision_tower: openai/clip-vit-large-patch14-336
+    args:
+      vision_tower_slow: convnext_large_mlp.clip_laion2b_ft_320
+      input_image_size: 1024
+      mm_vision_select_layer: -2
+      mm_vision_select_feature: patch
+      freeze_vision: False
+  projector:
+    _target_: src.lmms.models.llava_hr_vision.projector.build_vision_projector
+    config:
+      mm_projector_type: mlp2x_gelu
+      mm_hidden_size: 1024
+      hidden_size: 3072 # aka d_model
+llava_hr_3b_align:
+  encoder:
+    _target_: src.lmms.models.llava_hr_vision.multipath_encoder_wrapper.MultiPathCLIPVisionTower
+    vision_tower: openai/clip-vit-large-patch14-336
+    args:
+      vision_tower_slow: convnext_large_mlp.clip_laion2b_ft_320
+      input_image_size: 384
+      mm_vision_select_layer: -2
+      mm_vision_select_feature: patch
+      freeze_vision: True
+  projector:
+    _target_: src.lmms.models.llava_hr_vision.projector.build_vision_projector
+    config:
+      mm_projector_type: mlp2x_gelu
+      mm_hidden_size: 1024
+      hidden_size: 3072 # aka d_model

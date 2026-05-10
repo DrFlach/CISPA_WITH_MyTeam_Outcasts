@@ -1,0 +1,22 @@
+# Core ML
+numpy>=1.26
+pandas>=2.0
+scipy>=1.11
+scikit-learn>=1.4
+lightgbm>=4.3
+pyarrow>=15.0
+tqdm>=4.66
+
+# Submission upload
+requests>=2.31
+
+# GPU stack — install torch matching your CUDA version separately:
+# pip install torch --index-url https://download.pytorch.org/whl/cu121
+torch>=2.2
+transformers>=4.40
+accelerate>=0.30
+sentencepiece
+protobuf
+
+# Optional: 4-bit quantization (you don't need it with >100GB VRAM)
+# bitsandbytes

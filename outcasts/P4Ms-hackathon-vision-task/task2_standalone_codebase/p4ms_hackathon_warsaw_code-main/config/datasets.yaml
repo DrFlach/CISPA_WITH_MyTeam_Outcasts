@@ -1,0 +1,68 @@
+#### HACKATHON DATA ####
+
+
+#### TRAINING DATA ####
+llava_vqa:
+  _target_: src.lmms.dataset.general_vqa_dataset.LLaVAVQADataset
+  media_path: data/vpgtrans/coco/images
+  annot_path: data/moka/llava_instruct_150k.json
+  metadata_paths: 
+    - data/vpgtrans/coco/annotations/coco_karpathy_train.json
+  num_samples: 100000
+  questions_per_image: 2.3
+
+llava_cc3m:
+  _target_: src.lmms.dataset.general_vqa_dataset.LLaVACC3MPretrainDataset
+  media_path: data/vila/llava_cc3m/images
+  annot_path: data/vila/llava_cc3m/chat.json
+
+ocrvqa:
+  _target_: src.lmms.dataset.ocr_vqa_dataset.OCRVQADataset
+  media_path: data/moka/ocrvqa/{00000..00020}.tar
+  annot_path: data/moka/ocrvqa/dataset.json
+  num_samples: 100000
+  split: train
+  buffer_size: 100
+  questions_per_image: 2.95
+
+synthdog_en:
+  _target_: src.lmms.dataset.general_vqa_dataset.SynthDogENDataset
+  cache_dir: data/moka/synthdog_en_cache
+  num_samples: 200000
+  buffer_size: 100
+
+text_ocr:
+  _target_: src.lmms.dataset.ocr_vqa_dataset.TextOCRDataset
+  media_path: data/moka/textcaps
+  annot_path: data/moka/textocr.json
+
+text_caps:
+  _target_: src.lmms.dataset.general_vqa_dataset.TextCapsDataset
+  media_path: data/moka/textcaps
+  annot_path: data/moka/textcaps.json
+  num_samples: 50000
+
+arxiv_qa:
+  _target_: src.lmms.dataset.general_vqa_dataset.ArxivQADataset
+  media_path: data/moka/arxiv_qa
+  num_samples: 10000
+
+#### HACKATHON DATA ####
+
+p4ms_vqa_hf_task:
+  _target_: src.lmms.dataset.general_vqa_dataset.HFP4MsVQADataset
+  hf_repo: SprintML/P4Ms-hackathon-vision-task
+  hf_config: task
+  hf_split: train
+
+p4ms_vqa_hf_validation_w_pii_image_and_text:
+  _target_: src.lmms.dataset.general_vqa_dataset.HFP4MsVQADataset
+  hf_repo: SprintML/P4Ms-hackathon-vision-task
+  hf_config: validation_pii
+  hf_split: train
+
+p4ms_vqa_hf_validation_wo_pii_image_w_pii_text:
+  _target_: src.lmms.dataset.general_vqa_dataset.HFP4MsVQADataset
+  hf_repo: SprintML/P4Ms-hackathon-vision-task
+  hf_config: validation_pii_txt_only
+  hf_split: train
