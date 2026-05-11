@@ -4,3 +4,6 @@ My teammates:
 
 * Ilya Perepechyn
 * Pavlo Naniak
+
+<img width="1094" height="801" alt="image" src="https://github.com/user-attachments/assets/5515359a-8cdf-4dba-902c-3b8bf12b9c1d" />
+
